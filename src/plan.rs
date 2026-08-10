@@ -37,6 +37,12 @@ pub mod action {
     /// Ensure a role's packages/services are present. `params`: `role`.
     /// Used only as a fallback for roles without a built-in expansion.
     pub const ROLE_PROVISION: &str = "role.provision";
+    /// Set the agent's environment and whether it is tracked. `params`:
+    /// `environment` (required), `monitored` (`true`|`false`), optional
+    /// `note`. The agent persists both locally and stops shipping telemetry
+    /// while untracked — an agent that doesn't know it is untracked keeps
+    /// reporting, and the silence the operator asked for never arrives.
+    pub const AGENT_ENVIRONMENT: &str = "agent.environment";
     /// Fallback passthrough for an intent the planner doesn't specialize.
     /// `params`: the intent's params verbatim, plus `intent`.
     pub const INTENT_CUSTOM: &str = "intent.custom";
@@ -223,6 +229,30 @@ pub fn plan_intent(req: &PlanRequest) -> TransactionPlan {
             };
             vec![service_step(get(&req.params, "name"), run_state, enabled)]
         }
+        "set_environment" => {
+            let env = get(&req.params, "environment");
+            let env = if env.is_empty() { "production" } else { env };
+            // Anything other than an explicit false leaves the machine
+            // tracked: a malformed param must not be the reason a production
+            // box goes quiet.
+            let monitored = match get(&req.params, "monitored").to_ascii_lowercase().as_str() {
+                "false" | "0" | "no" => "false",
+                _ => "true",
+            };
+            // Not critical, and not compensated. Failing to apply an
+            // environment label should not abort a batch, and "undoing" it
+            // would mean guessing what the machine was before — the Hub and
+            // Nexus both hold that answer, so a re-push is the honest repair.
+            vec![step(
+                action::AGENT_ENVIRONMENT,
+                params_of(&[
+                    ("environment", env),
+                    ("monitored", monitored),
+                    ("note", get(&req.params, "note")),
+                ]),
+                false,
+            )]
+        }
         "deploy_file" => vec![step(
             action::FILE_WRITE,
             params_of(&[
@@ -358,6 +388,57 @@ mod tests {
         assert_eq!(
             plan.steps[0].params.get("role").map(String::as_str),
             Some("mystery")
+        );
+    }
+
+    #[test]
+    fn set_environment_carries_environment_and_tracking() {
+        let mut r = req("set_environment");
+        r.params.insert("environment".into(), "development".into());
+        r.params.insert("monitored".into(), "false".into());
+        r.params.insert("note".into(), "lab rebuild".into());
+        let plan = plan_intent(&r);
+        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(plan.steps[0].action, action::AGENT_ENVIRONMENT);
+        assert_eq!(
+            plan.steps[0].params.get("environment").map(String::as_str),
+            Some("development")
+        );
+        assert_eq!(
+            plan.steps[0].params.get("monitored").map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            plan.steps[0].params.get("note").map(String::as_str),
+            Some("lab rebuild")
+        );
+        // A label is not worth aborting a batch over.
+        assert!(!plan.steps[0].critical);
+    }
+
+    #[test]
+    fn set_environment_defaults_to_tracked_production() {
+        // A caller that sends neither param must not mute the machine, and
+        // must not leave it with an empty environment nothing can group by.
+        let plan = plan_intent(&req("set_environment"));
+        assert_eq!(
+            plan.steps[0].params.get("environment").map(String::as_str),
+            Some("production")
+        );
+        assert_eq!(
+            plan.steps[0].params.get("monitored").map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn set_environment_treats_garbage_tracking_as_tracked() {
+        let mut r = req("set_environment");
+        r.params.insert("monitored".into(), "maybe".into());
+        let plan = plan_intent(&r);
+        assert_eq!(
+            plan.steps[0].params.get("monitored").map(String::as_str),
+            Some("true")
         );
     }
 
