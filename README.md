@@ -18,6 +18,19 @@ explicit. An intent the planner does not specialize degrades to a single
 | `deploy_file` | `file.write` |
 | `provision_<role>` | the role's packages + services, or a `role.provision` marker |
 | `set_environment` | `agent.environment` |
+| `restart_service` / `start_service` / `stop_service` | `service.ensure` with `restart: "true"` / `state: started` / `state: stopped` (the unit comes from param `service`, or `name`) |
+| `refresh_inventory` | `agent.facts` — the agent ships a facts report now |
+| `lock_session` | `command.run` `loginctl lock-sessions` |
+| `install_dns_server` | `dns.server.ensure` (critical; no params) |
+| `dns_zone_apply` | `dns.zone.apply` (critical): `zone`, `content`, `role` (default `primary`), `primaries`, `secondaries`, `serial` |
+| `dns_zone_remove` | `dns.zone.remove` (critical): `zone` |
+| `mount_volume` | `disk.mount` (critical): `device`, `mountPoint`, `fsType` (default `ext4`), `format` (default `if_blank`) |
+
+Params that are absent or empty on the intent are left out of the step, never
+sent as empty strings. The infrastructure intents (`install_dns_server`,
+`dns_zone_*`, `mount_volume`) are what Nexus dispatches for its DNS and cloud
+APIs; the service, inventory and lock intents are what the Hub's machine
+command panel sends.
 
 ### `set_environment`
 
