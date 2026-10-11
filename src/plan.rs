@@ -4,7 +4,8 @@
 //! "run this command", "provision this role". The orchestrator resolves each
 //! intent into an ordered [`TransactionPlan`] of canonical [`PlanStep`]s that an
 //! agent knows how to execute. The step vocabulary here is the contract the
-//! agent implements, so it is deliberately small and explicit.
+//! agent implements, so it is deliberately small and explicit — and an intent
+//! outside it is a [`PlanError`], never a plan the agent cannot run.
 //!
 //! This is the operational planner. It is separate from the economic
 //! demand/supply routing in `allocation`/`rebalancer`, which plans labor for the
@@ -66,9 +67,33 @@ pub mod action {
     /// formats a device that already carries a filesystem or partition
     /// table, writes an fstab line by UUID with `nofail`, and mounts.
     pub const DISK_MOUNT: &str = "disk.mount";
-    /// Fallback passthrough for an intent the planner doesn't specialize.
-    /// `params`: the intent's params verbatim, plus `intent`.
-    pub const INTENT_CUSTOM: &str = "intent.custom";
+    /// Run a script. `params`: `script` (required), `interpreter` (a path or
+    /// program; default `/bin/sh`), `timeout_seconds` (default `600`),
+    /// optional `args` (whitespace-separated), `elevated` (`true` runs as
+    /// root). The agent writes the script to a private temp file, runs it
+    /// and reports the exit code.
+    pub const SCRIPT_RUN: &str = "script.run";
+    /// List pending package upgrades (read-only). `params`: none; the agent
+    /// writes `{manager, count, patches: [...]}` JSON to the step output.
+    pub const PATCHES_LIST: &str = "patches.list";
+    /// Install package upgrades. `params`: `packages` — comma-separated
+    /// names or `name=version` pairs, or `all`. The agent treats this as
+    /// destructive (suppressed without its destructive allowance).
+    pub const PATCHES_INSTALL: &str = "patches.install";
+    /// List virtual machines on a hypervisor host (read-only). `params`:
+    /// none; the agent writes `{hypervisor, count, vms: [...]}` JSON.
+    pub const VMS_LIST: &str = "vms.list";
+}
+
+/// Why an intent could not be planned. Returned to Nexus as `400` so the
+/// task fails at once with the reason, instead of reaching an agent as a
+/// step it cannot execute.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PlanError {
+    #[error("unknown intent {0:?}")]
+    UnknownIntent(String),
+    #[error("intent {intent:?} needs param {param:?}")]
+    MissingParam { intent: String, param: &'static str },
 }
 
 /// What Nexus forwards to the orchestrator, mirroring Daedalus IT's TaskRequest.
@@ -206,18 +231,25 @@ fn provision_steps(role: &str) -> Vec<PlanStep> {
     }
 }
 
+/// The value of `key` in `p`, or `default` when absent or empty.
+fn get_or<'a>(p: &'a BTreeMap<String, String>, key: &str, default: &'a str) -> &'a str {
+    let v = get(p, key);
+    if v.is_empty() { default } else { v }
+}
+
 /// Resolve an intent into a concrete plan.
 ///
 /// Recognized intents mirror the node actions Daedalus IT dispatches
 /// (`restart_node`, `power_off_node`, `power_on_node`, `run_command`,
 /// `lock_session`, `refresh_inventory`, `restart_service` / `start_service` /
-/// `stop_service`), the infrastructure intents Nexus dispatches
-/// (`install_dns_server`, `dns_zone_apply`, `dns_zone_remove`,
-/// `mount_volume`), plus the `provision_<role>` family from client
-/// onboarding. Anything else is planned
-/// as a single passthrough `intent.custom` step so unknown intents degrade
-/// safely rather than being dropped.
-pub fn plan_intent(req: &PlanRequest) -> TransactionPlan {
+/// `stop_service`), its automation and patching intents (`run_script`,
+/// `list_patches`, `install_patches`, `list_vms`), the infrastructure
+/// intents Nexus dispatches (`install_dns_server`, `dns_zone_apply`,
+/// `dns_zone_remove`, `mount_volume`), plus the `provision_<role>` family
+/// from client onboarding. Anything else is a [`PlanError::UnknownIntent`]:
+/// the agent has no step for it, and a loud planning failure beats a plan
+/// that reaches the host and fails there (or, worse, is skipped).
+pub fn plan_intent(req: &PlanRequest) -> Result<TransactionPlan, PlanError> {
     let task_id = req
         .task_id
         .clone()
@@ -366,23 +398,67 @@ pub fn plan_intent(req: &PlanRequest) -> TransactionPlan {
             ]),
             true,
         )],
+        "run_script" => {
+            let script = get(&req.params, "script");
+            if script.is_empty() {
+                return Err(PlanError::MissingParam {
+                    intent: req.intent.clone(),
+                    param: "script",
+                });
+            }
+            // The Hub names the interpreter by shell keyword (`shell`:
+            // bash/python/powershell) and the timeout as `timeout`; an
+            // explicit `interpreter` / `timeout_seconds` wins.
+            let interpreter = get_or(
+                &req.params,
+                "interpreter",
+                get_or(&req.params, "shell", "/bin/sh"),
+            );
+            let timeout = get_or(
+                &req.params,
+                "timeout_seconds",
+                get_or(&req.params, "timeout", "600"),
+            );
+            vec![step(
+                action::SCRIPT_RUN,
+                params_of(&[
+                    ("interpreter", interpreter),
+                    ("script", script),
+                    ("timeout_seconds", timeout),
+                    ("args", get(&req.params, "args")),
+                    ("elevated", get(&req.params, "elevated")),
+                ]),
+                true,
+            )]
+        }
+        "list_patches" => vec![step(action::PATCHES_LIST, BTreeMap::new(), true)],
+        "install_patches" => {
+            // The Hub sends `packages` (comma-separated `name=version`);
+            // `ids` is accepted for hand-written intents. Empty means all.
+            let packages = get_or(&req.params, "packages", get_or(&req.params, "ids", "all"));
+            // Not compensated: there is no safe generic "downgrade", and the
+            // agent already refuses to run this without its destructive
+            // allowance.
+            vec![step(
+                action::PATCHES_INSTALL,
+                params_of(&[("packages", packages)]),
+                true,
+            )]
+        }
+        "list_vms" => vec![step(action::VMS_LIST, BTreeMap::new(), true)],
         other if other.starts_with("provision_") => {
             provision_steps(other.trim_start_matches("provision_"))
         }
-        _ => {
-            let mut p = req.params.clone();
-            p.insert("intent".to_string(), req.intent.clone());
-            vec![step(action::INTENT_CUSTOM, p, false)]
-        }
+        other => return Err(PlanError::UnknownIntent(other.to_string())),
     };
 
-    TransactionPlan {
+    Ok(TransactionPlan {
         task_id,
         intent: req.intent.clone(),
         targets: req.targets.clone(),
         auto_rollback: req.auto_rollback,
         steps,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -398,6 +474,11 @@ mod tests {
             params: BTreeMap::new(),
             task_id: None,
         }
+    }
+
+    /// Plan an intent the tests expect to be plannable.
+    fn plan_intent(req: &PlanRequest) -> TransactionPlan {
+        super::plan_intent(req).unwrap_or_else(|e| panic!("{}: {e}", req.intent))
     }
 
     #[test]
@@ -546,14 +627,93 @@ mod tests {
     }
 
     #[test]
-    fn unknown_intent_degrades_to_custom() {
-        let plan = plan_intent(&req("do_something_novel"));
-        assert_eq!(plan.steps[0].action, action::INTENT_CUSTOM);
+    fn unknown_intent_fails_planning() {
         assert_eq!(
-            plan.steps[0].params.get("intent").map(String::as_str),
-            Some("do_something_novel")
+            super::plan_intent(&req("do_something_novel")).unwrap_err(),
+            PlanError::UnknownIntent("do_something_novel".into())
         );
-        assert!(!plan.steps[0].critical);
+        assert_eq!(
+            PlanError::UnknownIntent("do_something_novel".into()).to_string(),
+            "unknown intent \"do_something_novel\""
+        );
+    }
+
+    #[test]
+    fn run_script_maps_to_script_run_with_defaults() {
+        let mut r = req("run_script");
+        r.params.insert("script".into(), "echo hi".into());
+        let plan = plan_intent(&r);
+        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(plan.steps[0].action, action::SCRIPT_RUN);
+        assert!(plan.steps[0].critical);
+        assert!(plan.steps[0].compensation.is_none());
+        assert_eq!(param(&plan, "script"), Some("echo hi"));
+        assert_eq!(param(&plan, "interpreter"), Some("/bin/sh"));
+        assert_eq!(param(&plan, "timeout_seconds"), Some("600"));
+        assert_eq!(param(&plan, "args"), None);
+
+        // What the Hub's automation runner sends.
+        r.params.insert("shell".into(), "bash".into());
+        r.params.insert("timeout".into(), "300".into());
+        r.params.insert("args".into(), "--verbose".into());
+        r.params.insert("elevated".into(), "true".into());
+        let plan = plan_intent(&r);
+        assert_eq!(param(&plan, "interpreter"), Some("bash"));
+        assert_eq!(param(&plan, "timeout_seconds"), Some("300"));
+        assert_eq!(param(&plan, "args"), Some("--verbose"));
+        assert_eq!(param(&plan, "elevated"), Some("true"));
+
+        // Explicit names win over the Hub's.
+        r.params
+            .insert("interpreter".into(), "/usr/bin/perl".into());
+        r.params.insert("timeout_seconds".into(), "42".into());
+        let plan = plan_intent(&r);
+        assert_eq!(param(&plan, "interpreter"), Some("/usr/bin/perl"));
+        assert_eq!(param(&plan, "timeout_seconds"), Some("42"));
+    }
+
+    #[test]
+    fn run_script_without_a_script_fails_planning() {
+        assert_eq!(
+            super::plan_intent(&req("run_script")).unwrap_err(),
+            PlanError::MissingParam {
+                intent: "run_script".into(),
+                param: "script",
+            }
+        );
+    }
+
+    #[test]
+    fn patch_intents_map_to_patch_steps() {
+        let plan = plan_intent(&req("list_patches"));
+        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(plan.steps[0].action, action::PATCHES_LIST);
+        assert!(plan.steps[0].params.is_empty());
+
+        let plan = plan_intent(&req("install_patches"));
+        assert_eq!(plan.steps[0].action, action::PATCHES_INSTALL);
+        assert!(plan.steps[0].critical);
+        assert!(plan.steps[0].compensation.is_none());
+        assert_eq!(param(&plan, "packages"), Some("all"));
+
+        let mut r = req("install_patches");
+        r.params
+            .insert("packages".into(), "nginx=1.24-1,openssl".into());
+        assert_eq!(
+            param(&plan_intent(&r), "packages"),
+            Some("nginx=1.24-1,openssl")
+        );
+        let mut r = req("install_patches");
+        r.params.insert("ids".into(), "nginx".into());
+        assert_eq!(param(&plan_intent(&r), "packages"), Some("nginx"));
+    }
+
+    #[test]
+    fn list_vms_maps_to_vms_list() {
+        let plan = plan_intent(&req("list_vms"));
+        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(plan.steps[0].action, action::VMS_LIST);
+        assert!(plan.steps[0].params.is_empty());
     }
 
     fn param<'a>(plan: &'a TransactionPlan, key: &str) -> Option<&'a str> {

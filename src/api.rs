@@ -6,18 +6,21 @@
 //! development.
 //!
 //! * `GET  /healthz` — liveness.
-//! * `POST /plan`    — resolve an intent into a plan.
+//! * `GET  /metrics` — Prometheus counters (open, like `/healthz`).
+//! * `POST /plan`    — resolve an intent into a plan; `400` with
+//!   `{"error", "intent"}` when the intent cannot be planned.
 
 use axum::{
+    Json, Router,
     extract::State,
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
 };
 use serde_json::json;
 
-use crate::plan::{plan_intent, PlanRequest, PlanResponse};
+use crate::metrics;
+use crate::plan::{PlanRequest, PlanResponse, plan_intent};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -28,12 +31,22 @@ pub struct AppState {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/metrics", get(metrics_text))
         .route("/plan", post(plan))
+        .layer(axum::middleware::from_fn(metrics::count_request))
         .with_state(state)
 }
 
 async fn healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok")
+}
+
+async fn metrics_text() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        metrics::render(),
+    )
 }
 
 async fn plan(
@@ -45,7 +58,19 @@ async fn plan(
         return unauthorized();
     }
 
-    let plan = plan_intent(&req);
+    let plan = match plan_intent(&req) {
+        Ok(p) => p,
+        Err(e) => {
+            metrics::plan_failed();
+            tracing::warn!(intent = %req.intent, error = %e, "intent rejected");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": e.to_string(), "intent": req.intent })),
+            )
+                .into_response();
+        }
+    };
+    metrics::plan_ok();
     let resp = PlanResponse {
         task_id: plan.task_id.clone(),
         status: "planned".to_string(),
